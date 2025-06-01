@@ -1,0 +1,1046 @@
+---
+title: "Analysis"
+format: html
+editor: visual
+---
+
+```{r message=FALSE, warning=FALSE}
+#| label: Data Preparation
+#| echo: false
+
+# 1) General -----
+
+rm(list = ls())
+gc()
+
+library(tidyverse)
+library(ggplot2)
+library(fixest)
+library(modelsummary)
+library(pandoc)
+library(officer)
+library(flextable)
+library(here)
+
+
+# 2) Data Management ----
+
+## load data
+load(here("Data", "250416DataSHPLongCleaned.RData"))
+
+## Work-related Events: Only respondents in workforce
+SHPP_work <- SHPP %>%
+  filter(!OCCUPA %in% c(8, 9))
+
+## Work_related Satisfaction: no retirement, job loss, and working; set to working == 0 to NA to be dropped
+SHPP$Work_Satisfaction[SHPP$working == 0] <- NA
+SHPP$Work_Income_Satisfaction[SHPP$working == 0] <- NA
+
+## Life satisfaction variables 1: can be regressed on all events
+LS_vars1 <-c(
+  "General_Life_Satisfaction",
+  "Personal_Relationships_Satisfaction",
+  "Health_Satisfaction",
+  "Leisure_Satisfaction"
+)
+
+## Life Satisfaction variables 2: Need some work-related events removed (event vars 2)
+LS_vars2 <-c(
+  "Work_Satisfaction",
+  "Work_Income_Satisfaction"
+)
+
+# Custom order for satisfaction outcomes
+LS_order <- c(
+  "General_Life_Satisfaction",
+  "Health_Satisfaction",
+  "Personal_Relationships_Satisfaction",
+  "Leisure_Satisfaction",
+  "Work_Satisfaction",
+  "Work_Income_Satisfaction"
+)
+
+## Events Variables 1: All Events
+event_vars_list1 <- c(
+  "Marriage_First", "Divorce_First", "Widowhood_First", "Unemployment_First", "Employment_First", "Retirement_First",
+  "Childbirth_First", "Childbirth_Second",
+  "Graduation_First", "Graduation_Second", "Graduation_Third",
+  "Illness_or_Accident_of_Self_First", "Illness_or_Accident_of_Self_Second", "Illness_or_Accident_of_Self_Third", 
+  "Illness_or_Accident_of_Self_Fourth", "Illness_or_Accident_of_Self_Fifth", "Illness_or_Accident_of_Self_Sixth", 
+  "Illness_or_Accident_of_Self_Seventh", "Illness_or_Accident_of_Self_Eighth",
+  "Death_of_Close_Relationship_First", "Death_of_Close_Relationship_Second", "Death_of_Close_Relationship_Third", 
+  "Death_of_Close_Relationship_Fourth", "Death_of_Close_Relationship_Fifth", "Death_of_Close_Relationship_Sixth", 
+  "Death_of_Close_Relationship_Seventh", "Death_of_Close_Relationship_Eighth",
+  "Termination_of_Close_Relationship_First", "Termination_of_Close_Relationship_Second", 
+  "Termination_of_Close_Relationship_Third", "Termination_of_Close_Relationship_Fourth",
+  "Illness_or_Accident_of_Close_Relationship_First", "Illness_or_Accident_of_Close_Relationship_Second", 
+  "Illness_or_Accident_of_Close_Relationship_Third", "Illness_or_Accident_of_Close_Relationship_Fourth", 
+  "Illness_or_Accident_of_Close_Relationship_Fifth", "Illness_or_Accident_of_Close_Relationship_Sixth", 
+  "Illness_or_Accident_of_Close_Relationship_Seventh", "Illness_or_Accident_of_Close_Relationship_Eighth", 
+  "Illness_or_Accident_of_Close_Relationship_Ninth", "Illness_or_Accident_of_Close_Relationship_Tenth", 
+  "Illness_or_Accident_of_Close_Relationship_Eleventh"
+)
+suffixes <- c("_lead2", "_lead1", "_lag1", "_lag2", "_lag3more")
+event_vars1 <- as.vector(outer(event_vars_list1, suffixes, paste0))
+rm(suffixes, event_vars_list1)
+
+## Event variables 2: Remove Specific work-related event lags-and leads that lead to illogical combinatins with work-related satisfaction
+vars_to_remove <- c(
+  "Unemployment_First_lag1",
+  "Retirement_First_lag1",
+  "Unemployment_First_lag2",
+  "Retirement_First_lag2",
+  "Unemployment_First_lag3more",
+  "Retirement_First_lag3more",
+  "Employment_First_lead1",
+  "Employment_First_lead2"
+)
+
+# Remove them from event_vars1
+event_vars2 <- setdiff(event_vars1, vars_to_remove)
+rm(vars_to_remove)
+
+# Control variables
+control_vars <- c("AGE", "AGE_squared", "elevation")
+
+# List of focal events
+focal_events <- c(
+  "Marriage_First", "Childbirth_First", "Childbirth_Second",  "Divorce_First", "Widowhood_First",  
+  "Death_of_Close_Relationship_First", "Termination_of_Close_Relationship_First",  
+  "Illness_or_Accident_of_Self_First", "Illness_or_Accident_of_Close_Relationship_First", 
+  "Employment_First",  "Graduation_First", "Retirement_First", "Unemployment_First"
+)
+
+
+
+# Define list of non-focal events to compare with each focal event
+nonfocal_events <- unique(grep("_(First|Second|Third|Fourth|Fifth|Sixth|Seventh|Eighth|Ninth|Tenth|Eleventh|Twelfth)$", names(SHPP), value = TRUE))
+
+
+# 3) Create Event Data set and set non-focal lagged events to 0 ----
+
+# Precompute first-year occurrence of all lag1 events
+# Identify all *_lag1 variables
+lag1_vars <- names(SHPP)[grepl("_lag1$", names(SHPP))]
+
+#For each IDPERS and each lag1 variable, get year of first occurrence
+event_timing <- SHPP %>%
+  select(IDPERS, YEAR, all_of(lag1_vars)) %>%
+  pivot_longer(cols = -c(IDPERS, YEAR), names_to = "event", values_to = "value") %>%
+  filter(value == 1) %>%
+  group_by(IDPERS, event) %>%
+  summarise(first_year = min(YEAR), .groups = "drop") %>%
+  pivot_wider(names_from = event, values_from = first_year, names_prefix = "year_")
+
+
+# Loop through each focal event ----
+for (event in focal_events) {
+  cat("\n Starting focal event:", event, "\n")
+
+  ### 3.1.1) Drop repeated non-focal event variables ----
+  base_event <- sub("_(First|Second)$", "", event)
+  repeat_suffixes <- c("Second", "Third", "Fourth", "Fifth", "Sixth", "Seventh", "Eighth", "Ninth", 
+                       "Tenth", "Eleventh", "Twelfth")
+  repeated_prefixes <- paste0(base_event, "_", repeat_suffixes)
+
+  # Exception: keep Childbirth_Second if it's the current focal event
+  if (event == "Childbirth_Second") {
+    repeated_prefixes <- setdiff(repeated_prefixes, "Childbirth_Second")
+  }
+
+  # Identify all repeated event variables to drop (if they exist)
+  repeated_vars <- unlist(lapply(repeated_prefixes, function(p) {
+    grep(paste0("^", p), names(SHPP), value = TRUE)
+  }))
+
+  temp_df <- if (length(repeated_vars) > 0) {
+    SHPP %>% select(-all_of(repeated_vars))
+  } else {
+    SHPP
+  }
+
+  ### 3.1.2) Loop through non-focal events to zero their lags/leads if they occur after the focal event ----
+  lag1_var <- paste0(event, "_lag1")
+
+  for (nonfocal_event in nonfocal_events) {
+    if (nonfocal_event == event) next  # Skip self-comparison
+
+    # Define lag/lead variables for nonfocal
+    nonfocal_lag1 <- paste0(nonfocal_event, "_lag1")
+    nonfocal_lag2 <- paste0(nonfocal_event, "_lag2")
+    nonfocal_lag3 <- paste0(nonfocal_event, "_lag3more")
+    nonfocal_lead1 <- paste0(nonfocal_event, "_lead1")
+    nonfocal_lead2 <- paste0(nonfocal_event, "_lead2")
+
+    # Define year columns from precomputed table
+    focal_col <- paste0("year_", lag1_var)
+    nonfocal_col <- paste0("year_", nonfocal_lag1)
+
+    # Join focal/nonfocal years from event_timing
+    temp_df <- temp_df %>%
+      left_join(event_timing %>% select(IDPERS, all_of(c(focal_col, nonfocal_col))), by = "IDPERS") %>%
+      rename(focal_year = !!focal_col, nonfocal_year = !!nonfocal_col)
+
+    # If nonfocal happened after focal → zero all nonfocal lags/leads
+    vars_to_zero <- c(nonfocal_lag1, nonfocal_lag2, nonfocal_lag3, nonfocal_lead1, nonfocal_lead2)
+    available_vars <- intersect(vars_to_zero, names(temp_df))
+
+    if (length(available_vars) > 0) {
+      temp_df <- temp_df %>%
+        mutate(nonfocal_happens_after_focal = !is.na(focal_year) & !is.na(nonfocal_year) & nonfocal_year > focal_year) %>%
+        mutate(across(all_of(available_vars), ~ ifelse(nonfocal_happens_after_focal, 0, .))) %>%
+        select(-nonfocal_happens_after_focal)
+    }
+
+    # Always remove the focal/nonfocal year columns to keep temp_df clean
+    temp_df <- temp_df %>% select(-focal_year, -nonfocal_year)
+  }
+
+  ### 3.1.3) Save cleaned dataset ----
+  assign(paste0("SHPP_", event), temp_df)
+  cat("Created: SHPP_", event, "\n")
+}
+
+
+
+# # 3.2) Example: Set non-focal lagged events to 0 ----
+# 
+#     # Define focal event and extract base
+#     event <- "Illness_or_Accident_of_Close_Relationship_First"
+#     base_event <- sub("_(First|Second)$", "", event)
+# 
+#     # 3.2.1) for focal event, drop repeated non-focal event variable ----
+# 
+#     # Define suffixes for repeated event occurence (including "_Second" to "_Twelfth")
+#       repeat_suffixes <- c("Second", "Third", "Fourth", "Fifth", 
+#                            "Sixth", "Seventh", "Eighth", "Ninth", 
+#                            "Tenth", "Eleventh", "Twelfth")
+#     
+#       # Created list of non-focal repeated event variables ("Childbirth_Second", ..., "Childbirth_Twelfth")
+#       repeated_prefixes <- paste0(base_event, "_", repeat_suffixes)
+#     
+#       # Exception: keep Childbirth_Second if it is the current focal event since it is the only second occurence focal event
+#       if (event == "Childbirth_Second") {
+#         repeated_prefixes <- setdiff(repeated_prefixes, "Childbirth_Second")
+#       }
+#     
+#       # Find all non-focal event variables in SHPP that start with any of the repeated prefixes (including lags/leads)
+#       repeated_vars <- unlist(lapply(repeated_prefixes, function(p) {
+#         grep(paste0("^", p), names(SHPP), value = TRUE)
+#       }))
+#     
+#       # Drop repeated non-focal event variables  if any are found
+#       if (length(repeated_vars) > 0) {
+#         temp_df <- SHPP %>% select(-all_of(repeated_vars))
+#       } else {
+#         temp_df <- SHPP
+#       }
+#       
+# # 3.2.2) Zero out all non-focal lags and leads if non-focal event occurs after focal event ----
+# 
+# # Define focal and non-focal event variable names
+# lag1_var <- paste0(event, "_lag1")
+# nonfocal_event <- "Death_of_Close_Relationship_First"
+# nonfocal_lag1 <- paste0(nonfocal_event, "_lag1")
+# nonfocal_lag2 <- paste0(nonfocal_event, "_lag2")
+# nonfocal_lag3 <- paste0(nonfocal_event, "_lag3more")
+# nonfocal_lead1 <- paste0(nonfocal_event, "_lead1")
+# nonfocal_lead2 <- paste0(nonfocal_event, "_lead2")
+# 
+# # Get year of focal and non-focal lag1 occurrences per individual
+# event_timing <- temp_df %>%
+#   filter(.data[[lag1_var]] == 1 | .data[[nonfocal_lag1]] == 1) %>%
+#   group_by(IDPERS) %>%
+#   summarise(
+#     focal_year = min(YEAR[.data[[lag1_var]] == 1], na.rm = TRUE),
+#     nonfocal_year = min(YEAR[.data[[nonfocal_lag1]] == 1], na.rm = TRUE),
+#     .groups = "drop"
+#   )
+# 
+# # Join timing info back to main df
+# temp_df <- temp_df %>%
+#   left_join(event_timing, by = "IDPERS") %>%
+#   arrange(IDPERS, YEAR)
+# 
+# # Flag: non-focal occurs after focal
+# temp_df <- temp_df %>%
+#   mutate(nonfocal_happens_after_focal = !is.na(focal_year) & !is.na(nonfocal_year) & nonfocal_year > focal_year)
+# 
+# # List of non-focal vars to zero
+# nonfocal_vars_to_zero <- c(nonfocal_lag1, nonfocal_lag2, nonfocal_lag3, nonfocal_lead1, nonfocal_lead2)
+# 
+# 
+# # 🔍 Get specific examples where nonfocal_lag1 is exactly before, after, or same year as focal
+# get_precise_example <- function(offset = 1) {
+#   temp_df %>%
+#     filter(!is.na(focal_year), !is.na(nonfocal_year)) %>%
+#     filter(nonfocal_year == focal_year + offset) %>%
+#     group_by(IDPERS) %>%
+#     filter(n() >= 5) %>%  # at least 5 years of data
+#     ungroup() %>%
+#     slice(1) %>%
+#     pull(IDPERS)
+# }
+# 
+# example_after <- get_precise_example(1)   # Non-focal lag1 one year after focal → should be zeroed
+# example_before <- get_precise_example(-1) # Non-focal lag1 one year before focal → should be kept
+# example_same <- get_precise_example(0)    # Non-focal lag1 in same year → should be kept
+# 
+# # Store data before zeroing
+# get_example_df <- function(id) {
+#   temp_df %>%
+#     filter(IDPERS == id) %>%
+#     select(IDPERS, YEAR,
+#            !!lag1_var, !!nonfocal_lag1, !!nonfocal_lag2, !!nonfocal_lag3,
+#            !!nonfocal_lead1, !!nonfocal_lead2,
+#            focal_year, nonfocal_year, nonfocal_happens_after_focal)
+# }
+# 
+# example_after_before_df <- if (!is.na(example_after)) get_example_df(example_after)
+# example_before_before_df <- if (!is.na(example_before)) get_example_df(example_before)
+# example_same_before_df <- if (!is.na(example_same)) get_example_df(example_same)
+# 
+# # Preview BEFORE zeroing
+# cat("\n BEFORE zeroing — non-focal AFTER focal (should be zeroed)\n")
+# if (exists("example_after_before_df")) print(example_after_before_df)
+# 
+# cat("\n🔎 BEFORE zeroing — non-focal BEFORE focal (should be kept)\n")
+# if (exists("example_before_before_df")) print(example_before_before_df)
+# 
+# cat("\n🔎 BEFORE zeroing — non-focal SAME YEAR as focal (should be kept)\n")
+# if (exists("example_same_before_df")) print(example_same_before_df)
+# 
+# #  Zero out non-focal vars completely for people where nonfocal happened after focal
+# temp_df <- temp_df %>%
+#   mutate(across(
+#     all_of(nonfocal_vars_to_zero),
+#     ~ ifelse(nonfocal_happens_after_focal, 0, .)
+#   ))
+# 
+# #  Preview AFTER zeroing
+# cat("\n AFTER zeroing — non-focal AFTER focal (should be zeroed)\n")
+# if (!is.na(example_after)) print(get_example_df(example_after))
+# 
+# cat("\n AFTER zeroing — non-focal BEFORE focal (should be kept)\n")
+# if (!is.na(example_before)) print(get_example_df(example_before))
+# 
+# cat("\n AFTER zeroing — non-focal SAME YEAR as focal (should be kept)\n")
+# if (!is.na(example_same)) print(get_example_df(example_same))
+
+
+
+
+```
+
+```{r}
+#| label: Model Estimation
+#| echo: false
+
+library(fixest)
+
+models_list <- list()
+
+for (focal_event in focal_events) {
+  data_name <- paste0("SHPP_", focal_event)
+  data_used <- get(data_name)
+
+  # Special case: truncate Death_of_Close_Relationship repetitions to 6 if Illness_or_Accident_of_Close_Relationship_First due to rarity (or multicollinearity ) problem 
+  if (focal_event == "Illness_or_Accident_of_Close_Relationship_First") {
+    death_reps <- paste0("Death_of_Close_Relationship_", c("First", "Second", "Third", "Fourth", "Fifth", "Sixth"))
+    death_vars <- unlist(lapply(death_reps, function(rep) {
+      grep(paste0("^", rep, "_"), names(data_used), value = TRUE)
+    }))
+  }
+
+  for (LS_set in list(LS_vars1, LS_vars2)) {
+    for (dep_var in LS_set) {
+
+      base_event_vars <- if (dep_var %in% LS_vars2) event_vars2 else event_vars1
+      base_event_vars <- base_event_vars[base_event_vars %in% names(data_used)]
+
+      # Special fix: limit Death_of_Close_Relationship repetitions to 6 for Illness_or_Accident_of_Close_Relationship_First due to rarity problem
+      if (focal_event == "Illness_or_Accident_of_Close_Relationship_First") {
+        base_event_vars <- c(
+          setdiff(base_event_vars, grep("^Death_of_Close_Relationship_", base_event_vars, value = TRUE)),
+          death_vars
+        )
+      }
+
+      individual_event_vars <- base_event_vars[grepl(paste0("^", focal_event, "_"), base_event_vars)]
+      if (length(individual_event_vars) == 0) {
+        message(" Skipping model for ", focal_event, " × ", dep_var, " — no focal event dummies found.")
+        next
+      }
+
+      if (!(dep_var %in% names(data_used))) {
+        message("⚠️ Skipping model for ", focal_event, " × ", dep_var, " — outcome not in dataset.")
+        next
+      }
+
+      regression_formula_unstd <- as.formula(paste(dep_var, "~", paste(c(base_event_vars, control_vars), collapse = " + "), "| IDPERS"))
+      individual_formula_unstd <- as.formula(paste(dep_var, "~", paste(c(individual_event_vars, control_vars), collapse = " + "), "| IDPERS"))
+
+      regression_formula_std <- as.formula(paste0("scale(", dep_var, ") ~ ", paste(paste0("scale(", c(base_event_vars, control_vars), ")"), collapse = " + "), "| IDPERS"))
+      individual_formula_std <- as.formula(paste0("scale(", dep_var, ") ~ ", paste(paste0("scale(", c(individual_event_vars, control_vars), ")"), collapse = " + "), "| IDPERS"))
+
+      all_vars_needed <- unique(c(
+        all.vars(individual_formula_unstd),
+        all.vars(regression_formula_unstd),
+        all.vars(individual_formula_std),
+        all.vars(regression_formula_std),
+        "IDPERS", "YEAR"
+      ))
+
+      SHPP_used <- na.omit(data_used[, all_vars_needed])
+      if (nrow(SHPP_used) == 0) {
+        message(" Skipping model for ", focal_event, " × ", dep_var, " — empty after NA removal.")
+        next
+      }
+
+      model_id <- paste(focal_event, dep_var, sep = "__")
+
+      tryCatch({
+        # Estimate models
+        individual_unstd <- feols(individual_formula_unstd, data = SHPP_used, cluster = ~IDPERS)
+        combined_unstd   <- feols(regression_formula_unstd, data = SHPP_used, cluster = ~IDPERS)
+        individual_std   <- feols(individual_formula_std, data = SHPP_used, cluster = ~IDPERS)
+        combined_std     <- feols(regression_formula_std, data = SHPP_used, cluster = ~IDPERS)
+      
+        # Apply summary with lean = TRUE to reduce object size
+        models_list[[model_id]] <- list(
+          individual_unstd = summary(individual_unstd, lean = TRUE),
+          combined_unstd   = summary(combined_unstd, lean = TRUE),
+          individual_std   = summary(individual_std, lean = TRUE),
+          combined_std     = summary(combined_std, lean = TRUE),
+          event_vars       = individual_event_vars,
+          control_vars     = control_vars,
+          n_obs            = nrow(SHPP_used),
+          n_individuals    = length(unique(SHPP_used$IDPERS))
+        )
+      
+        message(" Estimated model: ", model_id)
+      }, error = function(e) {
+        message(" Error estimating model for ", model_id, ": ", conditionMessage(e))
+      })
+    }
+  }
+}
+
+save(models_list, file = here("Data", "models_list.RData"))
+
+
+```
+
+```{r message=FALSE, warning=FALSE}
+#| label: Supplementary Tables
+#| echo: false
+
+library(here)
+load(here("Data", "models_list.RData"))
+
+# 1) Single Table Function and Loop  ----
+
+library(flextable)
+library(officer)
+library(dplyr)
+library(modelsummary)
+library(tidyr)
+
+# Start results counter
+results_list <- list()
+i <- 2
+
+# Iterate over the stored models in 'models_list'
+
+# Define your custom orders
+focal_events <- c(
+  "Marriage_First", "Childbirth_First", "Childbirth_Second",  "Divorce_First", "Widowhood_First",  
+  "Death_of_Close_Relationship_First", "Termination_of_Close_Relationship_First",  
+  "Illness_or_Accident_of_Self_First", "Illness_or_Accident_of_Close_Relationship_First", 
+  "Employment_First",  "Graduation_First", "Retirement_First", "Unemployment_First"
+)
+
+LS_order <- c(
+  "General_Life_Satisfaction",
+  "Health_Satisfaction",
+  "Personal_Relationships_Satisfaction",
+  "Leisure_Satisfaction",
+  "Work_Satisfaction",
+  "Work_Income_Satisfaction"
+)
+
+# Create a sorting dataframe
+model_df <- data.frame(
+  model_id    = names(models_list),
+  focal_event = sapply(strsplit(names(models_list), "__"), `[`, 1),
+  dep_var     = sapply(strsplit(names(models_list), "__"), `[`, 2),
+  stringsAsFactors = FALSE
+)
+
+# Add order columns
+model_df$focal_order <- match(model_df$focal_event, focal_events)
+model_df$dep_order   <- match(model_df$dep_var, LS_order)
+
+# Drop anything not in both lists
+model_df <- model_df[!is.na(model_df$focal_order) & !is.na(model_df$dep_order), ]
+
+# Sort accordingly
+model_df <- model_df[order(model_df$dep_order, model_df$focal_order), ]
+
+# Loop over sorted model IDs
+for (model_id in model_df$model_id) {
+
+  # Parse the model_id to get focal_event and dependent variable
+  # (because we stored them as "focalEvent__depVar")
+  parts <- strsplit(model_id, "__")[[1]]
+  focal_event <- parts[1]
+  dep_var     <- parts[2]
+
+  # Retrieve the 4 models
+  m_indiv_unstd <- models_list[[model_id]]$individual_unstd
+  m_comb_unstd  <- models_list[[model_id]]$combined_unstd
+  m_indiv_std   <- models_list[[model_id]]$individual_std
+  m_comb_std    <- models_list[[model_id]]$combined_std
+
+  # Also retrieve the event vars & N
+  event_vars    <- models_list[[model_id]]$event_vars
+  n_obs         <- models_list[[model_id]]$n_obs
+  n_individuals <- models_list[[model_id]]$n_individuals
+
+  # Labels of Coefficients
+  coef_labels <- c("2 years before event", "1 year before event",
+                   "1 year after event",  "2 years after event",
+                   "More than 2 years after event")
+
+  # The same number of labels as the number of event vars
+  num_event_vars <- length(event_vars)
+  custom_labels  <- coef_labels[1:num_event_vars]
+
+  # Build the mapping for unscaled & scaled terms
+  event_map_unstd <- setNames(custom_labels, event_vars)
+  event_map_std   <- setNames(custom_labels, paste0("scale(", event_vars, ")"))
+
+  # Combine them into a single map
+  coef_map <- c(
+    event_map_unstd,
+    event_map_std,
+    "AGE"            = "Age",
+    "AGE_squared"    = "Age Squared",
+    "scale(AGE)"     = "Age",
+    "scale(AGE_squared)" = "Age Squared"
+  )
+
+  # Build one combined table via modelsummary with customized statistics
+  tab_df <- modelsummary(
+    list(
+      "Individual Unstandardized"    = m_indiv_unstd,
+      "Combined Unstandardized"      = m_comb_unstd,
+      "Individual Standardized"      = m_indiv_std,
+      "Combined Standardized"        = m_comb_std
+    ),
+    coef_map   = coef_map,
+    statistic  = "p.value",
+    stars      = c('*' = 0.05, '**' = 0.01, '***' = 0.001),
+    gof_omit   = "AIC|BIC|Std\\.Errors|FE|^R2$|^R2 Within$|RMSE",
+    output     = "data.frame"
+  )
+
+  # Rename columns, remove part and statistic column
+  tab_df <- tab_df %>% 
+    select(-any_of(c("part", "statistic"))) 
+
+  # Indent or blank out repeated terms
+  tab_df$term <- ifelse(duplicated(tab_df$term), "", tab_df$term)
+  colnames(tab_df)[1] <- " "
+
+  # Replace 'Num.Obs.' row label with Observations
+  tab_df$` `[tab_df$` ` == "Num.Obs."] <- "Observations"
+
+  # Add row for unique individuals
+  obs_row <- which(tab_df$` ` == "Observations")[1]
+  new_row <- data.frame(matrix("", nrow=1, ncol=ncol(tab_df)))
+  colnames(new_row) <- colnames(tab_df)
+  new_row[1, 1] <- "Unique Individuals"
+  new_row[1, 2:ncol(tab_df)] <- n_individuals
+
+  tab_df <- rbind(
+    tab_df[1:obs_row, ],
+    new_row,
+    tab_df[(obs_row+1):nrow(tab_df), ]
+  )
+
+  # Build the flextable
+  hline_pos <- obs_row - 1
+  ft <- flextable(tab_df) %>%
+    theme_booktabs() %>%
+    set_table_properties(layout = "autofit") %>%
+    hline_top(border = fp_border(width = 1), part = "header") %>%
+    bold(part = "header", bold = FALSE) %>%
+    align(j = 2:ncol(tab_df), align = "center", part = "all") %>%
+    hline(i = hline_pos, part = "body")
+  
+  # Store in results_list
+  results_list[[paste0(focal_event, "_", dep_var)]] <- list(
+  table    = ft,
+  title    = paste0("Table S", i),
+  subtitle = paste0(
+    "Fixed Effects Model Predicting ",
+    gsub("^(Satisfaction_|General_)", "", gsub("_", " ", dep_var)),
+    " in Response to ",
+    gsub("_", " ", focal_event)
+  )
+)
+
+  i <- i + 1
+}
+
+# 2) Export to Word ----
+
+doc <- read_docx()
+table_counter <- 1
+
+for (dep_var in names(combined_unstd_tables)) {
+  
+  title_fpar <- fpar(
+    ftext(paste0("Table ", table_counter), prop = fp_text(bold = TRUE, font.size = 11))
+  )
+  
+  subtitle_fpar <- fpar(
+    ftext(paste0("Combined Models Unstandardized Estimates of ", 
+                 gsub("_", " ", dep_var)),
+          prop = fp_text(italic = TRUE, font.size = 10))
+  )
+  
+  note_fpar <- fpar(
+    ftext("Note. ", prop = fp_text(italic = TRUE, font.size = 10)),
+    ftext("", prop = fp_text(font.size = 10)),
+    ftext("p", prop = fp_text(italic = TRUE, font.size = 10)),
+    ftext("-values in parentheses. Fixed effects at person level. Individual models include only focal events; combined models control for non-focal events co-occurring or preceding the focal event. Standardized variables are z-standardized (", prop = fp_text(font.size = 10)),
+    ftext("M", prop = fp_text(italic = TRUE, font.size = 10)),
+    ftext(" = 0, ", prop = fp_text(font.size = 10)),
+    ftext("SD", prop = fp_text(italic = TRUE, font.size = 10)),
+    ftext(" = 1); coefficients represent standardized effects. ", prop = fp_text(font.size = 10)),
+    ftext("*", prop = fp_text(font.size = 10)),
+    ftext("p", prop = fp_text(italic = TRUE, font.size = 10)),
+    ftext(" < .05, **", prop = fp_text(font.size = 10)),
+    ftext("p", prop = fp_text(italic = TRUE, font.size = 10)),
+    ftext(" < .01, ***", prop = fp_text(font.size = 10)),
+    ftext("p", prop = fp_text(italic = TRUE, font.size = 10)),
+    ftext(" < .001", prop = fp_text(font.size = 10))
+  )
+  
+  doc <- doc %>%
+    body_add_fpar(title_fpar) %>%
+    body_add_par("", style = "Normal") %>%
+    body_add_fpar(subtitle_fpar) %>%
+    body_add_par("", style = "Normal") %>%
+    body_add_flextable(combined_unstd_tables[[dep_var]]) %>%
+    body_add_par("", style = "Normal") %>%
+    body_add_fpar(note_fpar) %>%
+    body_add_par("", style = "Normal") %>%
+    body_add_break()
+  
+  table_counter <- table_counter + 1
+}
+
+
+print(doc, target = here("Tables", "250507_Regression_Tables_Single_Individual_Combined_Unstd_Std.docx"))
+
+```
+
+```{r}
+#| label: Combined_Unstd_Overview_Tables
+#| echo: false
+
+library(tidyr)
+library(broom)
+library(dplyr)
+library(flextable)
+
+# Define pretty labels and order for time-relative dummies
+time_labels <- c(
+  "lead2"     = "2 years before",
+  "lead1"     = "1 year before",
+  "lag1"      = "1 year after",
+  "lag2"      = "2 years after",
+  "lag3more"  = "More than 2 years after"
+)
+all_time_keys <- names(time_labels)
+
+# Initialize a list to store one table per outcome
+combined_unstd_tables <- list()
+
+for (dep_var in LS_order) {
+  
+  relevant_models <- model_df %>%
+    filter(dep_var == !!dep_var) %>%
+    arrange(focal_order)
+  
+  rows_list <- list()
+  
+  for (i in seq_len(nrow(relevant_models))) {
+    model_id    <- relevant_models$model_id[i]
+    focal_event <- relevant_models$focal_event[i]
+    
+    model_obj  <- models_list[[model_id]]$combined_unstd
+    event_vars <- models_list[[model_id]]$event_vars
+    
+    model_tidy <- broom::tidy(model_obj)
+    
+    # Subset to terms that match exactly to event_vars (these are exact model terms)
+    model_tidy <- model_tidy %>%
+      filter(term %in% event_vars) %>%
+      mutate(
+        time_key = gsub(".*_", "", term),  # extract lead2, lag1, etc. from e.g., Marriage_First_lead2
+        stars = case_when(
+          p.value < 0.001 ~ "***",
+          p.value < 0.01  ~ "**",
+          p.value < 0.05  ~ "*",
+          TRUE            ~ ""
+        ),
+        estimate_p = sprintf("%.2f%s\n(%s)", estimate, stars, format.pval(p.value, digits = 2, eps = .001))
+      ) %>%
+      select(time_key, estimate_p)
+    
+    # Ensure all time vars are present
+    full_row <- tibble(time_key = all_time_keys) %>%
+      left_join(model_tidy, by = "time_key") %>%
+      mutate(estimate_p = ifelse(is.na(estimate_p), "", estimate_p)) %>%
+      pivot_wider(names_from = time_key, values_from = estimate_p)
+    
+    full_row <- mutate(full_row, `Life Event` = gsub("_", " ", focal_event)) %>%
+      select(`Life Event`, all_of(all_time_keys))
+    
+    rows_list[[focal_event]] <- full_row
+  }
+  
+  event_df <- bind_rows(rows_list)
+  
+  # Rename columns to pretty labels
+  colnames(event_df) <- recode(colnames(event_df), !!!time_labels)
+  
+  # Flextable
+  combined_unstd_tables[[dep_var]] <- flextable(event_df) %>%
+    theme_booktabs() %>%
+    set_table_properties(layout = "autofit") %>%
+    align(part = "all", align = "center") %>%
+    autofit()
+}
+
+
+#export word
+
+#| label: Export_Combined_Unstd_Tables
+#| echo: false
+
+doc <- read_docx()
+table_counter <- 2
+
+for (dep_var in names(combined_unstd_tables)) {
+  
+  title_fpar <- fpar(
+    ftext(paste0("Table ", table_counter), prop = fp_text(bold = TRUE, font.size = 11))
+  )
+  
+ subtitle_fpar <- fpar(
+  ftext(
+    paste0("Combined Models: Focal Events Predicting ", 
+           gsub("_", " ", dep_var), 
+           " (Unstandardized Estimates)"),
+    prop = fp_text(italic = TRUE, font.size = 10)
+  )
+)
+  
+note_fpar <- fpar(
+  ftext("Note. ", prop = fp_text(italic = TRUE, font.size = 10)),
+  ftext("p", prop = fp_text(italic = TRUE, font.size = 10)),
+  ftext("-values in parentheses. Fixed effects at person level. Combined models control for non-focal events co-occurring or preceding the focal event. ", prop = fp_text(font.size = 10)),
+  ftext("*", prop = fp_text(font.size = 10)),
+  ftext("p", prop = fp_text(italic = TRUE, font.size = 10)),
+  ftext(" < .05, **", prop = fp_text(font.size = 10)),
+  ftext("p", prop = fp_text(italic = TRUE, font.size = 10)),
+  ftext(" < .01, ***", prop = fp_text(font.size = 10)),
+  ftext("p", prop = fp_text(italic = TRUE, font.size = 10)),
+  ftext(" < .001", prop = fp_text(font.size = 10))
+)
+
+  
+  doc <- doc %>%
+    body_add_fpar(title_fpar) %>%
+    body_add_par("", style = "Normal") %>%
+    body_add_fpar(subtitle_fpar) %>%
+    body_add_par("", style = "Normal") %>%
+    body_add_flextable(combined_unstd_tables[[dep_var]]) %>%
+    body_add_par("", style = "Normal") %>%
+    body_add_fpar(note_fpar) %>%
+    body_add_par("", style = "Normal") %>%
+    body_add_break()
+  
+  table_counter <- table_counter + 1
+}
+
+
+# Save the document
+print(doc, target = here("Tables", "250507_seperate_satisfaction_tables.docx"))
+
+```
+
+```{r message=FALSE, warning=FALSE}
+#| label: Grid Trajectory Plots LS per Column
+#| echo: false
+
+load(here("Data", "models_list.RData"))
+
+library(dplyr)
+library(broom)
+library(ggplot2)
+library(stringr)
+library(tidyr)
+library(officer)
+library(here)
+
+# Define time mapping
+time_labels <- c("_lead2", "_lead1", "_lag1", "_lag2", "_lag3more")
+time_vals   <- c(-2, -1, 1, 2, 3)
+plot_time   <- 1:5
+
+# 1) Combined Models
+
+results_all <- list()
+
+for (model_name in names(models_list)) {
+  model_obj <- models_list[[model_name]]
+  parts <- strsplit(model_name, "__")[[1]]
+  focal_event <- parts[1]
+  dep_var <- parts[2]
+  terms <- paste0(focal_event, time_labels)
+
+  tidy_95 <- broom::tidy(model_obj$combined_unstd, conf.int = TRUE, conf.level = 0.95) %>%
+    filter(term %in% terms)
+
+  tidy_99 <- broom::tidy(model_obj$combined_unstd, conf.int = TRUE, conf.level = 0.99) %>%
+    filter(term %in% terms) %>%
+    select(term, conf.low, conf.high) %>%
+    rename(conf.low_99 = conf.low, conf.high_99 = conf.high)
+
+  tidy_df <- tidy_95 %>%
+    left_join(tidy_99, by = "term") %>%
+    mutate(
+      focal_event = focal_event,
+      dep_var = dep_var,
+      time_label = str_remove(term, paste0(focal_event, "_")),
+      time = case_when(
+        time_label == "lead2" ~ -2,
+        time_label == "lead1" ~ -1,
+        time_label == "lag1"  ~ 1,
+        time_label == "lag2"  ~ 2,
+        time_label == "lag3more" ~ 3
+      ),
+      plot_time = match(time, time_vals)
+    ) %>%
+    select(focal_event, dep_var, time, plot_time, estimate, conf.low, conf.high, conf.low_99, conf.high_99)
+
+  results_all[[model_name]] <- tidy_df
+}
+
+# Custom order for satisfaction outcomes
+LS_order <- c(
+  "General_Life_Satisfaction",
+  "Health_Satisfaction",
+  "Personal_Relationships_Satisfaction",
+  "Leisure_Satisfaction",
+  "Work_Satisfaction",
+  "Work_Income_Satisfaction"
+)
+
+# Clean labels first
+pretty_labels <- stringr::str_wrap(gsub("_", " ", LS_order), width = 25)
+
+plot_df <- bind_rows(results_all) %>%
+  mutate(
+    dep_var = gsub("_", " ", dep_var),
+    dep_var = str_wrap(dep_var, width = 25),
+    dep_var = factor(dep_var, levels = pretty_labels),
+    focal_event = str_wrap(gsub("_", " ", focal_event), width = 25)
+  )
+
+event_order <- c(
+  "Marriage First", "Childbirth First", "Childbirth Second",  
+  "Divorce First", "Widowhood First", "Death of Close Relationship First",
+  "Termination of Close Relationship First", "Illness or Accident of Self First",
+  "Illness or Accident of Close Relationship First", "Employment First", 
+  "Graduation First", "Retirement First", "Unemployment First"
+)
+
+# Wrap for display (match facet formatting)
+wrap_event <- function(events, width = 25) stringr::str_wrap(events, width = width)
+wrapped_order <- wrap_event(event_order)
+
+# Split into two pages (7 events on the first page)
+page_chunks <- list(
+  wrapped_order[1:7],
+  wrapped_order[8:13]
+)
+
+for (i in seq_along(page_chunks)) {
+  df_chunk <- plot_df %>%
+    filter(focal_event %in% page_chunks[[i]]) %>%
+    mutate(focal_event = factor(focal_event, levels = page_chunks[[i]]))  # preserve order
+
+  gg <- ggplot(df_chunk, aes(x = plot_time, y = estimate)) +
+    geom_vline(xintercept = 2.5, linetype = "dashed", size = 0.3, color = "gray50") +
+    geom_hline(yintercept = 0, color = "gray30", size = 0.3) +
+    geom_errorbar(aes(ymin = conf.low_99, ymax = conf.high_99), width = 0.15, color = "lightblue", size = 0.3) +
+    geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.1, color = "steelblue", size = 0.4) +
+    geom_line(color = "steelblue", size = 0.4, aes(group = 1)) +
+    geom_point(color = "steelblue", size = 0.8) +
+    facet_grid(focal_event ~ dep_var, switch = "y") +
+    scale_x_continuous(
+      breaks = 1:5,
+      labels = c("-2", "-1", "+1", "+2", "≥3")
+    ) +
+    scale_y_continuous(
+      limits = c(-1.75, 2),
+      breaks = seq(-1.5, 2, by = 0.5)
+    ) +
+    labs(
+      x = "Years Relative to Focal Event",
+      y = "Unstandardized Estimates of Focal Events"
+    ) +
+    theme_minimal(base_size = 8) +
+    theme(
+      panel.grid = element_line(color = "gray90", size = 0.25),
+      axis.line = element_line(color = "black", size = 0.3),
+      axis.ticks = element_line(color = "black", size = 0.3),
+      axis.text.x = element_text(size = 6),
+      axis.text.y = element_text(size = 6),
+      axis.title.x = element_text(size = 7),
+      axis.title.y = element_text(size = 7),
+      strip.text.x = element_text(size = 7),
+      strip.text.y = element_text(size = 7, angle = 0),
+      panel.spacing = unit(0.5, "lines"),
+      strip.placement = "outside"
+    )
+
+  ggsave(
+    filename = here("Figures", paste0("250417_Grid_LS_per_Colums_", i, ".pdf")),
+    plot = gg, width = 12, height = 8
+  )
+
+  ggsave(
+    filename = here("Figures", paste0("250417_Grid_LS_per_Colums_", i, ".png")),
+    plot = gg, width = 12, height = 8
+  )
+}
+
+
+# 2) Repeat for Individual Models
+
+results_all_individual <- list()
+
+for (model_name in names(models_list)) {
+  model_obj <- models_list[[model_name]]
+  parts <- strsplit(model_name, "__")[[1]]
+  focal_event <- parts[1]
+  dep_var <- parts[2]
+  terms <- paste0(focal_event, time_labels)
+
+  if (!"individual_unstd" %in% names(model_obj)) next
+
+  tidy_95 <- broom::tidy(model_obj$individual_unstd, conf.int = TRUE, conf.level = 0.95) %>%
+    filter(term %in% terms)
+
+  tidy_99 <- broom::tidy(model_obj$individual_unstd, conf.int = TRUE, conf.level = 0.99) %>%
+    filter(term %in% terms) %>%
+    select(term, conf.low, conf.high) %>%
+    rename(conf.low_99 = conf.low, conf.high_99 = conf.high)
+
+  tidy_df <- tidy_95 %>%
+    left_join(tidy_99, by = "term") %>%
+    mutate(
+      focal_event = focal_event,
+      dep_var = dep_var,
+      time_label = str_remove(term, paste0(focal_event, "_")),
+      time = case_when(
+        time_label == "lead2" ~ -2,
+        time_label == "lead1" ~ -1,
+        time_label == "lag1"  ~ 1,
+        time_label == "lag2"  ~ 2,
+        time_label == "lag3more" ~ 3
+      ),
+      plot_time = match(time, time_vals)
+    ) %>%
+    select(focal_event, dep_var, time, plot_time, estimate, conf.low, conf.high, conf.low_99, conf.high_99)
+
+  results_all_individual[[model_name]] <- tidy_df
+}
+
+plot_df_individual <- bind_rows(results_all_individual) %>%
+  mutate(
+    dep_var = gsub("_", " ", dep_var),
+    dep_var = str_wrap(dep_var, width = 25),
+    dep_var = factor(dep_var, levels = pretty_labels),
+    focal_event = str_wrap(gsub("_", " ", focal_event), width = 25)
+  )
+
+
+
+# Plot Individual Model Results (same layout, same chunking)
+
+for (i in seq_along(page_chunks)) {
+  df_chunk <- plot_df_individual %>%
+    filter(focal_event %in% page_chunks[[i]]) %>%
+    mutate(focal_event = factor(focal_event, levels = page_chunks[[i]]))
+
+  gg <- ggplot(df_chunk, aes(x = plot_time, y = estimate)) +
+    geom_vline(xintercept = 2.5, linetype = "dashed", size = 0.3, color = "gray50") +
+    geom_hline(yintercept = 0, color = "gray30", size = 0.3) +
+    geom_errorbar(aes(ymin = conf.low_99, ymax = conf.high_99), width = 0.15, color = "lightblue", size = 0.3) +
+    geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.1, color = "steelblue", size = 0.4) +
+    geom_line(color = "steelblue", size = 0.4, aes(group = 1)) +
+    geom_point(color = "steelblue", size = 0.8) +
+    facet_grid(focal_event ~ dep_var, switch = "y") +
+    scale_x_continuous(
+      breaks = 1:5,
+      labels = c("-2", "-1", "+1", "+2", "≥3")
+    ) +
+    scale_y_continuous(
+      limits = c(-1.75, 2),
+      breaks = seq(-1.5, 2, by = 0.5)
+    ) +
+    labs(
+      x = "Years Relative to Focal Event",
+      y = "Unstandardized Estimates of Focal Events (Individual Models)"
+    ) +
+    theme_minimal(base_size = 8) +
+    theme(
+      panel.grid = element_line(color = "gray90", size = 0.25),
+      axis.line = element_line(color = "black", size = 0.3),
+      axis.ticks = element_line(color = "black", size = 0.3),
+      axis.text.x = element_text(size = 6),
+      axis.text.y = element_text(size = 6),
+      axis.title.x = element_text(size = 7),
+      axis.title.y = element_text(size = 7),
+      strip.text.x = element_text(size = 7),
+      strip.text.y = element_text(size = 7, angle = 0),
+      panel.spacing = unit(0.5, "lines"),
+      strip.placement = "outside"
+    )
+
+  ggsave(
+    filename = here("Figures", paste0("250417_Grid_LS_per_Colums_Individual_", i, ".pdf")),
+    plot = gg, width = 12, height = 8
+  )
+
+  ggsave(
+    filename = here("Figures", paste0("250417_Grid_LS_per_Colums_Individual_", i, ".png")),
+    plot = gg, width = 12, height = 8
+  )
+}
+
+
+
+```
+
+```         
+```
